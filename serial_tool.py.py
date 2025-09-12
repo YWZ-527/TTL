@@ -3,10 +3,32 @@ import serial.tools.list_ports
 import threading
 import time
 import sys
+import os
 import argparse
 import queue
 import codecs
+import re
 from datetime import datetime
+import struct
+import math
+
+# 尝试导入可视化库
+try:
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from collections import deque
+    VISUALIZATION_AVAILABLE = True
+except ImportError:
+    VISUALIZATION_AVAILABLE = False
+    print("警告: matplotlib未安装，无法使用数据可视化功能")
+
+# 尝试导入readline用于命令补全
+try:
+    import readline
+    import rlcompleter
+    READLINE_AVAILABLE = True
+except ImportError:
+    READLINE_AVAILABLE = False
 
 # 颜色代码
 class Colors:
@@ -20,7 +42,7 @@ class Colors:
     RESET = '\033[0m'
     BOLD = '\033[1m'
 
-# 关键字颜色列表 - 不同的关键字使用不同的颜色
+# 关键字颜色列表
 KEYWORD_COLORS = [
     Colors.RED,      # 关键字1 - 红色
     Colors.GREEN,    # 关键字2 - 绿色
@@ -37,6 +59,71 @@ STANDARD_BAUDRATES = [
     38400, 57600, 115200, 230400, 460800, 921600
 ]
 
+# Modbus功能码
+MODBUS_FUNCTIONS = {
+    1: "Read Coils",
+    2: "Read Discrete Inputs",
+    3: "Read Holding Registers",
+    4: "Read Input Registers",
+    5: "Write Single Coil",
+    6: "Write Single Register",
+    15: "Write Multiple Coils",
+    16: "Write Multiple Registers"
+}
+
+class DataVisualizer:
+    """实时数据可视化类"""
+    def __init__(self, max_points=1000):
+        if not VISUALIZATION_AVAILABLE:
+            raise ImportError("matplotlib未安装，无法使用数据可视化功能")
+        
+        self.max_points = max_points
+        self.data_buffer = deque(maxlen=max_points)
+        self.time_buffer = deque(maxlen=max_points)
+        self.fig, self.ax = plt.subplots(figsize=(10, 6))
+        self.line, = self.ax.plot([], [], 'b-')
+        self.ax.set_ylim(0, 255)
+        self.ax.set_xlim(0, max_points)
+        self.ax.grid(True)
+        self.ax.set_title('实时串口数据')
+        self.ax.set_xlabel('时间')
+        self.ax.set_ylabel('数据值')
+        self.start_time = time.time()
+        self.is_running = False
+        
+    def update(self, data):
+        """更新数据"""
+        if not self.is_running:
+            return
+            
+        current_time = time.time() - self.start_time
+        if isinstance(data, (bytes, bytearray)):
+            for byte in data:
+                self.data_buffer.append(byte)
+                self.time_buffer.append(current_time)
+        else:
+            self.data_buffer.append(data)
+            self.time_buffer.append(current_time)
+            
+        # 更新图表
+        if len(self.data_buffer) > 1:
+            self.line.set_data(self.time_buffer, self.data_buffer)
+            self.ax.set_xlim(max(0, current_time - 10), max(10, current_time))
+            self.ax.set_ylim(min(0, min(self.data_buffer)), max(255, max(self.data_buffer)))
+            plt.pause(0.01)
+    
+    def start(self):
+        """启动可视化"""
+        self.is_running = True
+        plt.ion()
+        plt.show()
+        
+    def stop(self):
+        """停止可视化"""
+        self.is_running = False
+        plt.ioff()
+        plt.close()
+
 class SerialCommunicator:
     def __init__(self, port, baudrate=115200):
         self.port = port
@@ -50,29 +137,78 @@ class SerialCommunicator:
         self.receive_buffer = bytearray()
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.last_print_time = time.time()
-        self.packet_timeout = 0.01  # 默认数据包超时时间改为0.01秒
-        self.show_timestamp = False  # 时间戳显示开关，默认关闭
-        self.keyword_filters = {}    # 关键字筛选字典，key: 关键字, value: 颜色索引
+        self.packet_timeout = 0.01
+        self.show_timestamp = False
+        self.keyword_filters = {}
+        self.connection_retries = 3
+        self.retry_delay = 1
+        self.receive_count = 0
+        self.send_count = 0
+        self.error_count = 0
+        self.start_time = time.time()
         
-    def connect(self):
-        """连接串口"""
-        try:
-            self.ser = serial.Serial(
-                port=self.port,
-                baudrate=self.baudrate,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=0.1,
-                write_timeout=0.1
-            )
-            self.ser.reset_input_buffer()
-            self.ser.reset_output_buffer()
-            print(f"{Colors.GREEN}已连接到串口 {self.port}，波特率 {self.baudrate}{Colors.RESET}")
-            return True
-        except serial.SerialException as e:
-            print(f"{Colors.RED}连接串口失败: {e}{Colors.RESET}")
-            return False
+        # 数据记录功能
+        self.log_file = None
+        self.log_enabled = False
+        
+        # Modbus解析功能
+        self.modbus_parse_enabled = False
+        
+        # 数据可视化
+        self.visualizer = None
+        self.visualization_enabled = False
+        
+        # 命令历史
+        self.history_file = os.path.expanduser("~/.serial_tool_history")
+        self._setup_history()
+        
+    def _setup_history(self):
+        """设置命令历史"""
+        if READLINE_AVAILABLE:
+            try:
+                if os.path.exists(self.history_file):
+                    readline.read_history_file(self.history_file)
+                readline.set_history_length(1000)
+            except Exception:
+                pass
+    
+    def save_history(self):
+        """保存命令历史"""
+        if READLINE_AVAILABLE:
+            try:
+                readline.write_history_file(self.history_file)
+            except Exception:
+                pass
+    
+    def connect(self, retries=None, delay=None):
+        """带重试机制的连接"""
+        if retries is None:
+            retries = self.connection_retries
+        if delay is None:
+            delay = self.retry_delay
+            
+        for attempt in range(retries):
+            try:
+                self.ser = serial.Serial(
+                    port=self.port,
+                    baudrate=self.baudrate,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                    timeout=0.1,
+                    write_timeout=0.1
+                )
+                self.ser.reset_input_buffer()
+                self.ser.reset_output_buffer()
+                print(f"{Colors.GREEN}已连接到串口 {self.port}，波特率 {self.baudrate}{Colors.RESET}")
+                return True
+            except serial.SerialException as e:
+                if attempt < retries - 1:
+                    print(f"{Colors.YELLOW}连接失败，{delay}秒后重试... ({attempt+1}/{retries}){Colors.RESET}")
+                    time.sleep(delay)
+                else:
+                    print(f"{Colors.RED}连接串口失败: {e}{Colors.RESET}")
+                    return False
     
     def start_receiving(self):
         """启动接收线程"""
@@ -97,9 +233,10 @@ class SerialCommunicator:
         """接收数据的线程函数"""
         while self.running and self.ser and self.ser.is_open:
             try:
-                # 读取数据
+                # 使用内存视图提高性能
                 data = self.ser.read(self.ser.in_waiting or 1)
                 if data:
+                    self.receive_count += len(data)
                     try:
                         self.data_queue.put(data, timeout=0.1)
                     except queue.Full:
@@ -109,13 +246,24 @@ class SerialCommunicator:
                         except queue.Empty:
                             pass
                         self.data_queue.put(data, timeout=0.1)
+                        
+                    # 更新可视化
+                    if self.visualization_enabled and self.visualizer:
+                        self.visualizer.update(data)
+            except serial.SerialException as e:
+                if self.running:
+                    print(f"{Colors.RED}串口通信错误: {e}{Colors.RESET}")
+                    self.error_count += 1
+                    # 尝试重新连接
+                    if not self.connect():
+                        break
             except Exception as e:
                 if self.running:
                     print(f"{Colors.RED}接收数据错误: {e}{Colors.RESET}")
-                break
+                    self.error_count += 1
 
     def _process_data(self):
-        """处理数据的线程函数 - 优化数据包重组"""
+        """处理数据的线程函数"""
         last_data_time = time.time()
         
         while self.running:
@@ -140,6 +288,7 @@ class SerialCommunicator:
             except Exception as e:
                 if self.running:
                     print(f"{Colors.RED}处理数据错误: {e}{Colors.RESET}")
+                    self.error_count += 1
                 self.receive_buffer.clear()
     
     def _process_receive_buffer(self):
@@ -147,44 +296,94 @@ class SerialCommunicator:
         if not self.receive_buffer:
             return
             
+        # 记录原始数据
+        raw_data = bytes(self.receive_buffer)
+        
+        # Modbus协议解析
+        modbus_info = ""
+        if self.modbus_parse_enabled:
+            modbus_info = self._parse_modbus(raw_data)
+            if modbus_info:
+                print(f"{Colors.CYAN}{modbus_info}{Colors.RESET}")
+        
         if self.hex_display:
             # 十六进制显示模式
             hex_str = ' '.join([f'{b:02X}' for b in self.receive_buffer])
-            self._print_received_data(hex_str, is_hex=True)
+            self._print_received_data(hex_str, is_hex=True, raw_data=raw_data)
         else:
             # 文本显示模式
             try:
                 # 尝试解码为UTF-8
                 text = self.decoder.decode(bytes(self.receive_buffer), final=True)
                 if text.strip():
-                    self._print_received_data(text.strip())
+                    self._print_received_data(text.strip(), raw_data=raw_data)
             except UnicodeDecodeError:
                 # 解码失败，显示十六进制
                 hex_str = ' '.join([f'{b:02X}' for b in self.receive_buffer])
-                self._print_received_data(hex_str, is_hex=True)
+                self._print_received_data(hex_str, is_hex=True, raw_data=raw_data)
         
         # 清空缓冲区
         self.receive_buffer.clear()
-        self.decoder.reset()  # 重置解码器
+        self.decoder.reset()
+    
+    def _parse_modbus(self, data):
+        """解析Modbus协议"""
+        if len(data) < 8:  # Modbus RTU最小帧长度
+            return ""
+            
+        try:
+            # 提取从站地址
+            slave_id = data[0]
+            
+            # 提取功能码
+            function_code = data[1]
+            function_name = MODBUS_FUNCTIONS.get(function_code, f"未知功能码 {function_code}")
+            
+            # 根据功能码解析
+            if function_code in [1, 2, 3, 4]:
+                # 读取请求
+                start_addr = (data[2] << 8) + data[3]
+                quantity = (data[4] << 8) + data[5]
+                return f"Modbus请求: 从站 {slave_id}, {function_name}, 起始地址 {start_addr}, 数量 {quantity}"
+                
+            elif function_code in [5, 6]:
+                # 写单个请求
+                output_addr = (data[2] << 8) + data[3]
+                output_value = (data[4] << 8) + data[5]
+                return f"Modbus请求: 从站 {slave_id}, {function_name}, 地址 {output_addr}, 值 {output_value}"
+                
+            elif function_code in [15, 16]:
+                # 写多个请求
+                start_addr = (data[2] << 8) + data[3]
+                quantity = (data[4] << 8) + data[5]
+                byte_count = data[6]
+                return f"Modbus请求: 从站 {slave_id}, {function_name}, 起始地址 {start_addr}, 数量 {quantity}, 字节数 {byte_count}"
+                
+            else:
+                return f"Modbus: 从站 {slave_id}, {function_name}"
+                
+        except Exception as e:
+            return f"Modbus解析错误: {e}"
     
     def _highlight_keywords(self, text):
-        """高亮文本中的关键字"""
+        """使用正则表达式高效高亮关键字"""
         if not self.keyword_filters:
             return text
             
-        # 对每个关键字进行高亮处理
-        highlighted_text = text
-        for keyword, color_idx in self.keyword_filters.items():
+        # 构建正则表达式模式
+        pattern = '|'.join(map(re.escape, self.keyword_filters.keys()))
+        
+        def replace_match(match):
+            keyword = match.group(0)
+            color_idx = self.keyword_filters.get(keyword, 0)
             color = KEYWORD_COLORS[color_idx % len(KEYWORD_COLORS)]
-            # 替换关键字，但不改变原始文本的大小写
-            highlighted_text = highlighted_text.replace(
-                keyword, f"{color}{keyword}{Colors.BLUE}"
-            )
-            
-        return highlighted_text
+            return f"{color}{keyword}{Colors.BLUE}"
+        
+        # 使用正则表达式替换
+        return re.sub(pattern, replace_match, text)
     
-    def _print_received_data(self, data, is_hex=False):
-        """打印接收到的数据，支持时间戳和关键字筛选"""
+    def _print_received_data(self, data, is_hex=False, raw_data=None):
+        """打印接收到的数据"""
         # 添加时间戳（如果启用）
         timestamp = ""
         if self.show_timestamp:
@@ -192,18 +391,22 @@ class SerialCommunicator:
         
         # 处理关键字高亮
         if not is_hex and self.keyword_filters:
-            # 文本模式下高亮关键字
             highlighted_data = self._highlight_keywords(data)
-            if is_hex:
-                print(f"{Colors.MAGENTA}{timestamp}接收(十六进制): {highlighted_data}{Colors.RESET}")
-            else:
-                print(f"{Colors.BLUE}{timestamp}接收: {highlighted_data}{Colors.RESET}")
+            display_text = f"{Colors.BLUE}{timestamp}接收: {highlighted_data}{Colors.RESET}"
         else:
-            # 正常显示
             if is_hex:
-                print(f"{Colors.MAGENTA}{timestamp}接收(十六进制): {data}{Colors.RESET}")
+                display_text = f"{Colors.MAGENTA}{timestamp}接收(十六进制): {data}{Colors.RESET}"
             else:
-                print(f"{Colors.BLUE}{timestamp}接收: {data}{Colors.RESET}")
+                display_text = f"{Colors.BLUE}{timestamp}接收: {data}{Colors.RESET}"
+        
+        # 打印到控制台
+        print(display_text)
+        
+        # 记录到文件（如果启用）
+        if self.log_enabled and self.log_file:
+            log_entry = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} - RECV - {data}\n"
+            self.log_file.write(log_entry)
+            self.log_file.flush()
     
     def send_data(self, data):
         """发送数据到串口"""
@@ -221,18 +424,90 @@ class SerialCommunicator:
             
             # 发送数据
             self.ser.write(data)
+            self.send_count += len(data)
             
             # 直接显示用户输入的内容
             timestamp = ""
             if self.show_timestamp:
                 timestamp = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] "
-            print(f"{Colors.GREEN}{timestamp}发送: {original_input}{Colors.RESET}")
+            
+            display_text = f"{Colors.GREEN}{timestamp}发送: {original_input}{Colors.RESET}"
+            print(display_text)
+            
+            # 记录到文件（如果启用）
+            if self.log_enabled and self.log_file:
+                log_entry = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} - SEND - {original_input}\n"
+                self.log_file.write(log_entry)
+                self.log_file.flush()
             
             return True
         except Exception as e:
             print(f"{Colors.RED}发送数据失败: {e}{Colors.RESET}")
+            self.error_count += 1
             return False
     
+    def enable_logging(self, filename=None):
+        """启用数据记录"""
+        if filename is None:
+            filename = f"serial_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        
+        try:
+            self.log_file = open(filename, 'a', encoding='utf-8')
+            self.log_enabled = True
+            print(f"{Colors.GREEN}已启用数据记录到: {filename}{Colors.RESET}")
+            return True
+        except Exception as e:
+            print(f"{Colors.RED}启用数据记录失败: {e}{Colors.RESET}")
+            return False
+
+    def disable_logging(self):
+        """禁用数据记录"""
+        if self.log_file:
+            self.log_file.close()
+            self.log_file = None
+        self.log_enabled = False
+        print(f"{Colors.YELLOW}已禁用数据记录{Colors.RESET}")
+    
+    def toggle_modbus_parse(self):
+        """切换Modbus解析"""
+        self.modbus_parse_enabled = not self.modbus_parse_enabled
+        status = "开启" if self.modbus_parse_enabled else "关闭"
+        print(f"{Colors.YELLOW}Modbus解析已{status}{Colors.RESET}")
+    
+    def toggle_visualization(self):
+        """切换数据可视化"""
+        if not VISUALIZATION_AVAILABLE:
+            print(f"{Colors.RED}数据可视化功能不可用，请安装matplotlib{Colors.RESET}")
+            return
+            
+        if self.visualization_enabled:
+            self.visualization_enabled = False
+            if self.visualizer:
+                self.visualizer.stop()
+            print(f"{Colors.YELLOW}已关闭数据可视化{Colors.RESET}")
+        else:
+            try:
+                self.visualizer = DataVisualizer()
+                self.visualizer.start()
+                self.visualization_enabled = True
+                print(f"{Colors.GREEN}已开启数据可视化{Colors.RESET}")
+            except Exception as e:
+                print(f"{Colors.RED}启动数据可视化失败: {e}{Colors.RESET}")
+    
+    def show_statistics(self):
+        """显示通信统计信息"""
+        elapsed = time.time() - self.start_time
+        print(f"{Colors.CYAN}=== 通信统计 ===")
+        print(f"{Colors.CYAN}运行时间: {elapsed:.2f} 秒")
+        print(f"{Colors.CYAN}接收字节: {self.receive_count}")
+        print(f"{Colors.CYAN}发送字节: {self.send_count}")
+        print(f"{Colors.CYAN}错误计数: {self.error_count}")
+        if elapsed > 0:
+            print(f"{Colors.CYAN}接收速率: {self.receive_count/elapsed:.2f} 字节/秒")
+            print(f"{Colors.CYAN}发送速率: {self.send_count/elapsed:.2f} 字节/秒")
+        print(f"{Colors.CYAN}================{Colors.RESET}")
+    
+    # 其他方法保持不变...
     def set_hex_send(self, hex_mode):
         """设置十六进制发送模式"""
         self.hex_send = hex_mode
@@ -323,9 +598,14 @@ class SerialCommunicator:
             self.receive_thread.join(timeout=0.5)
         if hasattr(self, 'process_thread') and self.process_thread and self.process_thread.is_alive():
             self.process_thread.join(timeout=0.5)
+        if self.visualization_enabled and self.visualizer:
+            self.visualizer.stop()
         if self.ser and self.ser.is_open:
             self.ser.close()
-            print(f"{Colors.YELLOW}串口已关闭{Colors.RESET}")
+        if self.log_enabled and self.log_file:
+            self.log_file.close()
+        self.save_history()
+        print(f"{Colors.YELLOW}串口已关闭{Colors.RESET}")
 
 def list_serial_ports():
     """列出所有可用的串口设备"""
@@ -370,8 +650,32 @@ def select_baudrate():
         except ValueError:
             print(f"{Colors.RED}无效的波特率值{Colors.RESET}")
 
+def setup_autocomplete():
+    """设置命令自动补全"""
+    if not READLINE_AVAILABLE:
+        return
+        
+    # 定义可用的命令
+    commands = [
+        'send', 'hex', 'timeout', 'baud', 'timestamp', 
+        'filter add', 'filter remove', 'filter clear', 'filter list',
+        'quit', 'exit', 'stats', 'log', 'nolog', 'modbus',
+        'visual', 'help'
+    ]
+    
+    # 设置补全函数
+    def complete(text, state):
+        options = [cmd for cmd in commands if cmd.startswith(text)]
+        if state < len(options):
+            return options[state]
+        else:
+            return None
+    
+    readline.set_completer(complete)
+    readline.parse_and_bind("tab: complete")
+
 def main():
-    parser = argparse.ArgumentParser(description='高速串口通信工具 - 支持发送和接收数据')
+    parser = argparse.ArgumentParser(description='增强版串口通信工具')
     parser.add_argument('-p', '--port', help='串口设备名称 (如: COM3, /dev/ttyUSB0)')
     parser.add_argument('-b', '--baudrate', type=int, default=None, 
                        help='波特率 (默认: 115200)')
@@ -385,6 +689,12 @@ def main():
                        help='数据包超时时间 (默认: 0.01秒)')
     parser.add_argument('-ts', '--timestamp', action='store_true', default=False,
                        help='启用时间戳显示 (默认: 关闭)')
+    parser.add_argument('-log', '--log', action='store_true', default=False,
+                       help='启用数据记录 (默认: 关闭)')
+    parser.add_argument('-retry', '--retry', type=int, default=3,
+                       help='连接重试次数 (默认: 3)')
+    parser.add_argument('-delay', '--delay', type=float, default=1.0,
+                       help='连接重试延迟 (默认: 1.0秒)')
     
     args = parser.parse_args()
     
@@ -397,6 +707,9 @@ def main():
     if args.list:
         list_serial_ports()
         return
+    
+    # 设置命令自动补全
+    setup_autocomplete()
     
     # 确定波特率
     baudrate = args.baudrate if args.baudrate is not None else 115200
@@ -425,10 +738,16 @@ def main():
     # 创建串口通信对象
     communicator = SerialCommunicator(port_name, baudrate)
     communicator.set_packet_timeout(args.timeout)
+    communicator.connection_retries = args.retry
+    communicator.retry_delay = args.delay
     
     # 设置时间戳显示
     if args.timestamp:
         communicator.toggle_timestamp()
+    
+    # 设置数据记录
+    if args.log:
+        communicator.enable_logging()
     
     # 连接串口
     if not communicator.connect():
@@ -439,7 +758,7 @@ def main():
         communicator.close()
         return
     
-    print(f"\n{Colors.GREEN}高速串口通信工具已启动{Colors.RESET}")
+    print(f"\n{Colors.GREEN}增强版串口通信工具已启动{Colors.RESET}")
     print(f"{Colors.YELLOW}输入 'quit' 或 'exit' 退出程序{Colors.RESET}")
     print(f"{Colors.YELLOW}输入 'send <消息>' 发送消息，例如: send Hello World{Colors.RESET}")
     print(f"{Colors.YELLOW}输入 'hex' 切换十六进制显示模式{Colors.RESET}")
@@ -450,6 +769,12 @@ def main():
     print(f"{Colors.YELLOW}输入 'filter remove <关键字>' 移除筛选关键字{Colors.RESET}")
     print(f"{Colors.YELLOW}输入 'filter clear' 清除所有筛选关键字{Colors.RESET}")
     print(f"{Colors.YELLOW}输入 'filter list' 列出所有筛选关键字{Colors.RESET}")
+    print(f"{Colors.YELLOW}输入 'log' 启用数据记录{Colors.RESET}")
+    print(f"{Colors.YELLOW}输入 'nolog' 禁用数据记录{Colors.RESET}")
+    print(f"{Colors.YELLOW}输入 'modbus' 切换Modbus协议解析{Colors.RESET}")
+    print(f"{Colors.YELLOW}输入 'visual' 切换数据可视化{Colors.RESET}")
+    print(f"{Colors.YELLOW}输入 'stats' 显示通信统计{Colors.RESET}")
+    print(f"{Colors.YELLOW}输入 'help' 显示帮助信息{Colors.RESET}")
     print(f"{Colors.YELLOW}直接输入消息并按回车键发送{Colors.RESET}")
     print(f"{Colors.CYAN}{'-' * 50}{Colors.RESET}")
     
@@ -497,6 +822,26 @@ def main():
             elif user_input.lower() == 'filter list':
                 # 列出所有筛选关键字
                 communicator.list_filter_keywords()
+            elif user_input.lower() == 'log':
+                # 启用数据记录
+                communicator.enable_logging()
+            elif user_input.lower() == 'nolog':
+                # 禁用数据记录
+                communicator.disable_logging()
+            elif user_input.lower() == 'modbus':
+                # 切换Modbus解析
+                communicator.toggle_modbus_parse()
+            elif user_input.lower() == 'visual':
+                # 切换数据可视化
+                communicator.toggle_visualization()
+            elif user_input.lower() == 'stats':
+                # 显示统计信息
+                communicator.show_statistics()
+            elif user_input.lower() == 'help':
+                # 显示帮助信息
+                print(f"{Colors.CYAN}=== 帮助信息 ===")
+                print(f"{Colors.CYAN}请参考程序启动时的命令列表{Colors.RESET}")
+                print(f"{Colors.CYAN}================{Colors.RESET}")
             elif user_input:
                 # 直接发送输入的消息
                 communicator.send_data(user_input + '\n')
