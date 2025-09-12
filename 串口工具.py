@@ -167,6 +167,22 @@ class SerialCommunicator:
         self.receive_buffer.clear()
         self.decoder.reset()  # 重置解码器
     
+    def _highlight_keywords(self, text):
+        """高亮文本中的关键字"""
+        if not self.keyword_filters:
+            return text
+            
+        # 对每个关键字进行高亮处理
+        highlighted_text = text
+        for keyword, color_idx in self.keyword_filters.items():
+            color = KEYWORD_COLORS[color_idx % len(KEYWORD_COLORS)]
+            # 替换关键字，但不改变原始文本的大小写
+            highlighted_text = highlighted_text.replace(
+                keyword, f"{color}{keyword}{Colors.BLUE}"
+            )
+            
+        return highlighted_text
+    
     def _print_received_data(self, data, is_hex=False):
         """打印接收到的数据，支持时间戳和关键字筛选"""
         # 添加时间戳（如果启用）
@@ -174,23 +190,14 @@ class SerialCommunicator:
         if self.show_timestamp:
             timestamp = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] "
         
-        # 检查关键字筛选
-        matched_keyword = None
-        matched_color = None
-        
-        for keyword, color_idx in self.keyword_filters.items():
-            if keyword in data:
-                matched_keyword = keyword
-                matched_color = KEYWORD_COLORS[color_idx % len(KEYWORD_COLORS)]
-                break
-        
-        # 根据匹配情况选择颜色
-        if matched_keyword:
-            # 使用匹配关键字的颜色
+        # 处理关键字高亮
+        if not is_hex and self.keyword_filters:
+            # 文本模式下高亮关键字
+            highlighted_data = self._highlight_keywords(data)
             if is_hex:
-                print(f"{matched_color}{timestamp}接收(十六进制): {data}{Colors.RESET}")
+                print(f"{Colors.MAGENTA}{timestamp}接收(十六进制): {highlighted_data}{Colors.RESET}")
             else:
-                print(f"{matched_color}{timestamp}接收: {data}{Colors.RESET}")
+                print(f"{Colors.BLUE}{timestamp}接收: {highlighted_data}{Colors.RESET}")
         else:
             # 正常显示
             if is_hex:
