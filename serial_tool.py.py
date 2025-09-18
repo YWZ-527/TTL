@@ -493,12 +493,21 @@ class SerialCommunicator:
     def enable_logging(self, filename=None):
         """启用数据记录"""
         if filename is None:
-            filename = f"serial_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            # 获取当前脚本所在目录
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            filename = os.path.join(script_dir, f"serial_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+        else:
+            # 如果用户提供了相对路径，也转换为基于脚本目录的绝对路径
+            if not os.path.isabs(filename):
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                filename = os.path.join(script_dir, filename)
         
         try:
             self.log_file = open(filename, 'a', encoding='utf-8')
             self.log_enabled = True
-            print(f"{Colors.GREEN}已启用数据记录到: {filename}{Colors.RESET}")
+            # 获取文件的绝对路径并打印
+            abs_path = os.path.abspath(filename)
+            print(f"{Colors.GREEN}已启用数据记录到: {abs_path}{Colors.RESET}")
             return True
         except Exception as e:
             print(f"{Colors.RED}启用数据记录失败: {e}{Colors.RESET}")
