@@ -24,6 +24,12 @@ DEFAULT_STOPBITS = serial.STOPBITS_ONE
 DEFAULT_TIMEOUT = 0.1
 DEFAULT_WRITE_TIMEOUT = 0.1
 
+# 显示配置
+DEFAULT_SHOW_TIMESTAMP = False  # 是否显示时间戳
+DEFAULT_HEX_DISPLAY = False     # 是否默认十六进制显示
+DEFAULT_ENABLE_COLOR = True     # 是否启用颜色输出
+DEFAULT_ENCODING = 'UTF-8'      # 默认编码格式
+
 # 数据包处理配置
 DEFAULT_PACKET_TIMEOUT = 0.01  # 数据包超时时间（秒）
 
@@ -31,10 +37,19 @@ DEFAULT_PACKET_TIMEOUT = 0.01  # 数据包超时时间（秒）
 DEFAULT_CONNECTION_RETRIES = 3
 DEFAULT_RETRY_DELAY = 1.0
 
-# 显示配置
-DEFAULT_SHOW_TIMESTAMP = False  # 是否显示时间戳
-DEFAULT_HEX_DISPLAY = False     # 是否默认十六进制显示
-DEFAULT_ENABLE_COLOR = True     # 是否启用颜色输出
+
+# 支持的编码格式列表
+SUPPORTED_ENCODINGS = [
+    'UTF-8',
+    'GB2312',
+    'GBK',
+    'ASCII',
+    'Latin-1',
+    'UTF-16',
+    'UTF-16BE',
+    'UTF-16LE',
+    'ISO-8859-1'
+]
 
 # 功能配置
 DEFAULT_LOG_ENABLED = False     # 是否启用数据记录
@@ -175,7 +190,8 @@ class SerialCommunicator:
         self.hex_send = False
         self.hex_display = DEFAULT_HEX_DISPLAY
         self.receive_buffer = bytearray()
-        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self.current_encoding = DEFAULT_ENCODING
+        self.decoder = self._create_decoder(self.current_encoding)
         self.last_print_time = time.time()
         self.packet_timeout = DEFAULT_PACKET_TIMEOUT
         self.show_timestamp = DEFAULT_SHOW_TIMESTAMP
@@ -206,6 +222,14 @@ class SerialCommunicator:
         self.history_file = os.path.expanduser("~/.serial_tool_history")
         self._setup_history()
         
+    def _create_decoder(self, encoding):
+        """创建指定编码的解码器"""
+        try:
+            return codecs.getincrementaldecoder(encoding)("replace")
+        except LookupError:
+            print(f"{Colors.YELLOW}不支持的编码格式: {encoding}, 使用UTF-8代替{Colors.RESET}")
+            return codecs.getincrementaldecoder("utf-8")("replace")
+    
     def _setup_history(self):
         """设置命令历史"""
         try:
@@ -357,7 +381,7 @@ class SerialCommunicator:
         else:
             # 文本显示模式
             try:
-                # 尝试解码为UTF-8
+                # 使用当前编码解码
                 text = self.decoder.decode(bytes(self.receive_buffer), final=True)
                 if text.strip():
                     self._print_received_data(text.strip(), raw_data=raw_data)
@@ -436,19 +460,19 @@ class SerialCommunicator:
         # 处理关键字高亮
         if not is_hex and self.keyword_filters:
             highlighted_data = self._highlight_keywords(data)
-            display_text = f"{Colors.BLUE}{timestamp}接收: {highlighted_data}{Colors.RESET}"
+            display_text = f"{Colors.BLUE}{timestamp}接收({self.current_encoding}): {highlighted_data}{Colors.RESET}"
         else:
             if is_hex:
                 display_text = f"{Colors.MAGENTA}{timestamp}接收(十六进制): {data}{Colors.RESET}"
             else:
-                display_text = f"{Colors.BLUE}{timestamp}接收: {data}{Colors.RESET}"
+                display_text = f"{Colors.BLUE}{timestamp}接收({self.current_encoding}): {data}{Colors.RESET}"
         
         # 打印到控制台
         print(display_text)
         
         # 记录到文件（如果启用）
         if self.log_enabled and self.log_file:
-            log_entry = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} - RECV - {data}\n"
+            log_entry = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} - RECV({self.current_encoding}) - {data}\n"
             self.log_file.write(log_entry)
             self.log_file.flush()
     
@@ -489,6 +513,25 @@ class SerialCommunicator:
             print(f"{Colors.RED}发送数据失败: {e}{Colors.RESET}")
             self.error_count += 1
             return False
+    
+    def set_encoding(self, encoding):
+        """设置编码格式"""
+        if encoding not in SUPPORTED_ENCODINGS:
+            print(f"{Colors.RED}不支持的编码格式: {encoding}{Colors.RESET}")
+            print(f"{Colors.YELLOW}支持的编码格式: {', '.join(SUPPORTED_ENCODINGS)}{Colors.RESET}")
+            return False
+            
+        self.current_encoding = encoding
+        self.decoder = self._create_decoder(encoding)
+        print(f"{Colors.GREEN}编码格式已设置为: {encoding}{Colors.RESET}")
+        return True
+    
+    def list_encodings(self):
+        """列出所有支持的编码格式"""
+        print(f"{Colors.CYAN}支持的编码格式:{Colors.RESET}")
+        for i, encoding in enumerate(SUPPORTED_ENCODINGS, 1):
+            marker = " *" if encoding == self.current_encoding else ""
+            print(f"{Colors.CYAN}{i:2d}. {encoding}{marker}{Colors.RESET}")
     
     def enable_logging(self, filename=None):
         """启用数据记录"""
@@ -557,6 +600,7 @@ class SerialCommunicator:
         print(f"{Colors.CYAN}接收字节: {self.receive_count}")
         print(f"{Colors.CYAN}发送字节: {self.send_count}")
         print(f"{Colors.CYAN}错误计数: {self.error_count}")
+        print(f"{Colors.CYAN}当前编码: {self.current_encoding}")
         if elapsed > 0:
             print(f"{Colors.CYAN}接收速率: {self.receive_count/elapsed:.2f} 字节/秒")
             print(f"{Colors.CYAN}发送速率: {self.send_count/elapsed:.2f} 字节/秒")
@@ -716,7 +760,7 @@ def setup_autocomplete():
             'send', 'hex', 'timeout', 'baud', 'timestamp', 
             'filter add', 'filter remove', 'filter clear', 'filter list',
             'quit', 'exit', 'stats', 'log', 'nolog', 'modbus',
-            'visual', 'help'
+            'visual', 'help', 'encoding', 'encodings'
         ]
         
         # 设置补全函数
@@ -739,6 +783,8 @@ def main():
                        help=f'串口设备名称 (如: COM3, /dev/ttyUSB0) (默认: {DEFAULT_PORT})')
     parser.add_argument('-b', '--baudrate', type=int, default=DEFAULT_BAUDRATE, 
                        help=f'波特率 (默认: {DEFAULT_BAUDRATE})')
+    parser.add_argument('-e', '--encoding', default=DEFAULT_ENCODING,
+                       help=f'编码格式 (默认: {DEFAULT_ENCODING})')
     parser.add_argument('-l', '--list', action='store_true', 
                        help='列出所有可用的串口设备')
     parser.add_argument('-c', '--color', action='store_true', default=DEFAULT_ENABLE_COLOR,
@@ -771,6 +817,11 @@ def main():
     if args.list:
         list_serial_ports()
         return
+    
+    # 检查编码格式是否支持
+    if args.encoding not in SUPPORTED_ENCODINGS:
+        print(f"{Colors.YELLOW}不支持的编码格式: {args.encoding}, 使用默认编码: {DEFAULT_ENCODING}{Colors.RESET}")
+        args.encoding = DEFAULT_ENCODING
     
     # 设置命令自动补全
     setup_autocomplete()
@@ -808,6 +859,9 @@ def main():
     communicator.modbus_parse_enabled = args.modbus
     communicator.visualization_enabled = args.visual
     
+    # 设置编码格式
+    communicator.set_encoding(args.encoding)
+    
     # 设置数据记录
     if args.log:
         communicator.enable_logging()
@@ -822,12 +876,13 @@ def main():
         return
     
     print(f"\n{Colors.GREEN}增强版串口通信工具已启动{Colors.RESET}")
-    print(f"{Colors.YELLOW}输入 'quit' 或 'exit' 退出程序{Colors.RESET}")
-    print(f"{Colors.YELLOW}输入 'send <消息>' 发送消息，例如: send Hello World{Colors.RESET}")
+    print(f"{Colors.YELLOW}输入 直接发送消息，例如: send Hello World{Colors.RESET}")
     print(f"{Colors.YELLOW}输入 'hex' 切换十六进制显示模式{Colors.RESET}")
     print(f"{Colors.YELLOW}输入 'timeout <秒数>' 设置数据包超时时间，例如: timeout 0.05{Colors.RESET}")
     print(f"{Colors.YELLOW}输入 'baud <波特率>' 更改波特率，例如: baud 9600{Colors.RESET}")
     print(f"{Colors.YELLOW}输入 'timestamp' 切换时间戳显示{Colors.RESET}")
+    print(f"{Colors.YELLOW}输入 'encoding <编码>' 设置编码格式，例如: encoding GB2312{Colors.RESET}")
+    print(f"{Colors.YELLOW}输入 'encodings' 列出所有支持的编码格式{Colors.RESET}")
     print(f"{Colors.YELLOW}输入 'filter add <关键字>' 添加筛选关键字，例如: filter add ERROR{Colors.RESET}")
     print(f"{Colors.YELLOW}输入 'filter remove <关键字>' 移除筛选关键字{Colors.RESET}")
     print(f"{Colors.YELLOW}输入 'filter clear' 清除所有筛选关键字{Colors.RESET}")
@@ -838,7 +893,6 @@ def main():
     print(f"{Colors.YELLOW}输入 'visual' 切换数据可视化{Colors.RESET}")
     print(f"{Colors.YELLOW}输入 'stats' 显示通信统计{Colors.RESET}")
     print(f"{Colors.YELLOW}输入 'help' 显示帮助信息{Colors.RESET}")
-    print(f"{Colors.YELLOW}直接输入消息并按回车键发送{Colors.RESET}")
     print(f"{Colors.CYAN}{'-' * 50}{Colors.RESET}")
     
     try:
@@ -871,6 +925,13 @@ def main():
             elif user_input.lower() == 'timestamp':
                 # 切换时间戳显示
                 communicator.toggle_timestamp()
+            elif user_input.lower().startswith('encoding '):
+                # 设置编码格式
+                encoding = user_input[9:]
+                communicator.set_encoding(encoding)
+            elif user_input.lower() == 'encodings':
+                # 列出所有支持的编码格式
+                communicator.list_encodings()
             elif user_input.lower().startswith('filter add '):
                 # 添加筛选关键字
                 keyword = user_input[11:]
