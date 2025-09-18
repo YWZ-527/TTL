@@ -12,25 +12,45 @@ from datetime import datetime
 import struct
 import math
 
-# 尝试导入可视化库
-try:
-    import matplotlib.pyplot as plt
-    import numpy as np
-    from collections import deque
-    VISUALIZATION_AVAILABLE = True
-except ImportError:
-    VISUALIZATION_AVAILABLE = False
-    print("警告: matplotlib未安装，无法使用数据可视化功能")
+# ==================== 配置区域 ====================
+# 在这里修改默认配置
 
-# 尝试导入readline用于命令补全
-try:
-    import readline
-    import rlcompleter
-    READLINE_AVAILABLE = True
-except ImportError:
-    READLINE_AVAILABLE = False
+# 串口默认配置
+DEFAULT_PORT = None  # 默认端口，None表示自动选择
+DEFAULT_BAUDRATE = 115200
+DEFAULT_BYTESIZE = serial.EIGHTBITS
+DEFAULT_PARITY = serial.PARITY_NONE
+DEFAULT_STOPBITS = serial.STOPBITS_ONE
+DEFAULT_TIMEOUT = 0.1
+DEFAULT_WRITE_TIMEOUT = 0.1
 
-# 颜色代码
+# 数据包处理配置
+DEFAULT_PACKET_TIMEOUT = 0.01  # 数据包超时时间（秒）
+
+# 连接配置
+DEFAULT_CONNECTION_RETRIES = 3
+DEFAULT_RETRY_DELAY = 1.0
+
+# 显示配置
+DEFAULT_SHOW_TIMESTAMP = False  # 是否显示时间戳
+DEFAULT_HEX_DISPLAY = False     # 是否默认十六进制显示
+DEFAULT_ENABLE_COLOR = True     # 是否启用颜色输出
+
+# 功能配置
+DEFAULT_LOG_ENABLED = False     # 是否启用数据记录
+DEFAULT_MODBUS_PARSE_ENABLED = False  # 是否启用Modbus解析
+DEFAULT_VISUALIZATION_ENABLED = False  # 是否启用数据可视化
+
+# 数据记录配置
+DEFAULT_LOG_FILENAME = None  # None表示自动生成
+
+# 关键字筛选配置
+DEFAULT_KEYWORD_FILTERS = {}  # 默认关键字筛选字典
+
+# 可视化配置
+DEFAULT_VISUALIZATION_MAX_POINTS = 1000
+
+# ==================== 颜色配置 ====================
 class Colors:
     RED = '\033[91m'
     GREEN = '\033[92m'
@@ -53,6 +73,7 @@ KEYWORD_COLORS = [
     Colors.WHITE     # 关键字7 - 白色
 ]
 
+# ==================== 常量定义 ====================
 # 常用波特率列表
 STANDARD_BAUDRATES = [
     300, 600, 1200, 2400, 4800, 9600, 14400, 19200, 28800, 
@@ -71,16 +92,24 @@ MODBUS_FUNCTIONS = {
     16: "Write Multiple Registers"
 }
 
+# ==================== 类定义 ====================
 class DataVisualizer:
     """实时数据可视化类"""
-    def __init__(self, max_points=1000):
-        if not VISUALIZATION_AVAILABLE:
+    def __init__(self, max_points=DEFAULT_VISUALIZATION_MAX_POINTS):
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+            from collections import deque
+            self.plt = plt
+            self.np = np
+            self.deque = deque
+        except ImportError:
             raise ImportError("matplotlib未安装，无法使用数据可视化功能")
         
         self.max_points = max_points
-        self.data_buffer = deque(maxlen=max_points)
-        self.time_buffer = deque(maxlen=max_points)
-        self.fig, self.ax = plt.subplots(figsize=(10, 6))
+        self.data_buffer = self.deque(maxlen=max_points)
+        self.time_buffer = self.deque(maxlen=max_points)
+        self.fig, self.ax = self.plt.subplots(figsize=(10, 6))
         self.line, = self.ax.plot([], [], 'b-')
         self.ax.set_ylim(0, 255)
         self.ax.set_xlim(0, max_points)
@@ -110,38 +139,53 @@ class DataVisualizer:
             self.line.set_data(self.time_buffer, self.data_buffer)
             self.ax.set_xlim(max(0, current_time - 10), max(10, current_time))
             self.ax.set_ylim(min(0, min(self.data_buffer)), max(255, max(self.data_buffer)))
-            plt.pause(0.01)
+            self.plt.pause(0.01)
     
     def start(self):
         """启动可视化"""
         self.is_running = True
-        plt.ion()
-        plt.show()
+        self.plt.ion()
+        self.plt.show()
         
     def stop(self):
         """停止可视化"""
         self.is_running = False
-        plt.ioff()
-        plt.close()
+        self.plt.ioff()
+        self.plt.close()
 
 class SerialCommunicator:
-    def __init__(self, port, baudrate=115200):
+    def __init__(self, port=DEFAULT_PORT, baudrate=DEFAULT_BAUDRATE, 
+                 bytesize=DEFAULT_BYTESIZE, parity=DEFAULT_PARITY, 
+                 stopbits=DEFAULT_STOPBITS, timeout=DEFAULT_TIMEOUT, 
+                 write_timeout=DEFAULT_WRITE_TIMEOUT):
+        # 串口配置
         self.port = port
         self.baudrate = baudrate
+        self.bytesize = bytesize
+        self.parity = parity
+        self.stopbits = stopbits
+        self.timeout = timeout
+        self.write_timeout = write_timeout
+        
+        # 状态变量
         self.ser = None
         self.running = False
         self.receive_thread = None
         self.data_queue = queue.Queue(maxsize=1000)
         self.hex_send = False
-        self.hex_display = False
+        self.hex_display = DEFAULT_HEX_DISPLAY
         self.receive_buffer = bytearray()
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.last_print_time = time.time()
-        self.packet_timeout = 0.01
-        self.show_timestamp = False
-        self.keyword_filters = {}
-        self.connection_retries = 3
-        self.retry_delay = 1
+        self.packet_timeout = DEFAULT_PACKET_TIMEOUT
+        self.show_timestamp = DEFAULT_SHOW_TIMESTAMP
+        self.keyword_filters = DEFAULT_KEYWORD_FILTERS.copy()
+        
+        # 连接配置
+        self.connection_retries = DEFAULT_CONNECTION_RETRIES
+        self.retry_delay = DEFAULT_RETRY_DELAY
+        
+        # 统计信息
         self.receive_count = 0
         self.send_count = 0
         self.error_count = 0
@@ -149,14 +193,14 @@ class SerialCommunicator:
         
         # 数据记录功能
         self.log_file = None
-        self.log_enabled = False
+        self.log_enabled = DEFAULT_LOG_ENABLED
         
         # Modbus解析功能
-        self.modbus_parse_enabled = False
+        self.modbus_parse_enabled = DEFAULT_MODBUS_PARSE_ENABLED
         
         # 数据可视化
         self.visualizer = None
-        self.visualization_enabled = False
+        self.visualization_enabled = DEFAULT_VISUALIZATION_ENABLED
         
         # 命令历史
         self.history_file = os.path.expanduser("~/.serial_tool_history")
@@ -164,21 +208,21 @@ class SerialCommunicator:
         
     def _setup_history(self):
         """设置命令历史"""
-        if READLINE_AVAILABLE:
-            try:
-                if os.path.exists(self.history_file):
-                    readline.read_history_file(self.history_file)
-                readline.set_history_length(1000)
-            except Exception:
-                pass
+        try:
+            import readline
+            if os.path.exists(self.history_file):
+                readline.read_history_file(self.history_file)
+            readline.set_history_length(1000)
+        except ImportError:
+            pass
     
     def save_history(self):
         """保存命令历史"""
-        if READLINE_AVAILABLE:
-            try:
-                readline.write_history_file(self.history_file)
-            except Exception:
-                pass
+        try:
+            import readline
+            readline.write_history_file(self.history_file)
+        except ImportError:
+            pass
     
     def connect(self, retries=None, delay=None):
         """带重试机制的连接"""
@@ -192,11 +236,11 @@ class SerialCommunicator:
                 self.ser = serial.Serial(
                     port=self.port,
                     baudrate=self.baudrate,
-                    bytesize=serial.EIGHTBITS,
-                    parity=serial.PARITY_NONE,
-                    stopbits=serial.STOPBITS_ONE,
-                    timeout=0.1,
-                    write_timeout=0.1
+                    bytesize=self.bytesize,
+                    parity=self.parity,
+                    stopbits=self.stopbits,
+                    timeout=self.timeout,
+                    write_timeout=self.write_timeout
                 )
                 self.ser.reset_input_buffer()
                 self.ser.reset_output_buffer()
@@ -476,7 +520,9 @@ class SerialCommunicator:
     
     def toggle_visualization(self):
         """切换数据可视化"""
-        if not VISUALIZATION_AVAILABLE:
+        try:
+            import matplotlib
+        except ImportError:
             print(f"{Colors.RED}数据可视化功能不可用，请安装matplotlib{Colors.RESET}")
             return
             
@@ -507,7 +553,6 @@ class SerialCommunicator:
             print(f"{Colors.CYAN}发送速率: {self.send_count/elapsed:.2f} 字节/秒")
         print(f"{Colors.CYAN}================{Colors.RESET}")
     
-    # 其他方法保持不变...
     def set_hex_send(self, hex_mode):
         """设置十六进制发送模式"""
         self.hex_send = hex_mode
@@ -607,6 +652,7 @@ class SerialCommunicator:
         self.save_history()
         print(f"{Colors.YELLOW}串口已关闭{Colors.RESET}")
 
+# ==================== 辅助函数 ====================
 def list_serial_ports():
     """列出所有可用的串口设备"""
     ports = serial.tools.list_ports.comports()
@@ -631,8 +677,8 @@ def select_baudrate():
             
             # 如果用户直接按回车，使用默认波特率115200
             if choice == "":
-                print(f"{Colors.YELLOW}使用默认波特率: 115200{Colors.RESET}")
-                return 115200
+                print(f"{Colors.YELLOW}使用默认波特率: {DEFAULT_BAUDRATE}{Colors.RESET}")
+                return DEFAULT_BAUDRATE
                 
             if choice.isdigit():
                 choice_num = int(choice)
@@ -652,49 +698,58 @@ def select_baudrate():
 
 def setup_autocomplete():
     """设置命令自动补全"""
-    if not READLINE_AVAILABLE:
-        return
+    try:
+        import readline
+        import rlcompleter
         
-    # 定义可用的命令
-    commands = [
-        'send', 'hex', 'timeout', 'baud', 'timestamp', 
-        'filter add', 'filter remove', 'filter clear', 'filter list',
-        'quit', 'exit', 'stats', 'log', 'nolog', 'modbus',
-        'visual', 'help'
-    ]
-    
-    # 设置补全函数
-    def complete(text, state):
-        options = [cmd for cmd in commands if cmd.startswith(text)]
-        if state < len(options):
-            return options[state]
-        else:
-            return None
-    
-    readline.set_completer(complete)
-    readline.parse_and_bind("tab: complete")
+        # 定义可用的命令
+        commands = [
+            'send', 'hex', 'timeout', 'baud', 'timestamp', 
+            'filter add', 'filter remove', 'filter clear', 'filter list',
+            'quit', 'exit', 'stats', 'log', 'nolog', 'modbus',
+            'visual', 'help'
+        ]
+        
+        # 设置补全函数
+        def complete(text, state):
+            options = [cmd for cmd in commands if cmd.startswith(text)]
+            if state < len(options):
+                return options[state]
+            else:
+                return None
+        
+        readline.set_completer(complete)
+        readline.parse_and_bind("tab: complete")
+    except ImportError:
+        pass
 
+# ==================== 主函数 ====================
 def main():
     parser = argparse.ArgumentParser(description='增强版串口通信工具')
-    parser.add_argument('-p', '--port', help='串口设备名称 (如: COM3, /dev/ttyUSB0)')
-    parser.add_argument('-b', '--baudrate', type=int, default=None, 
-                       help='波特率 (默认: 115200)')
+    parser.add_argument('-p', '--port', default=DEFAULT_PORT, 
+                       help=f'串口设备名称 (如: COM3, /dev/ttyUSB0) (默认: {DEFAULT_PORT})')
+    parser.add_argument('-b', '--baudrate', type=int, default=DEFAULT_BAUDRATE, 
+                       help=f'波特率 (默认: {DEFAULT_BAUDRATE})')
     parser.add_argument('-l', '--list', action='store_true', 
                        help='列出所有可用的串口设备')
-    parser.add_argument('-c', '--color', action='store_true', default=True,
-                       help='启用彩色输出 (默认: 启用)')
+    parser.add_argument('-c', '--color', action='store_true', default=DEFAULT_ENABLE_COLOR,
+                       help=f'启用彩色输出 (默认: {"启用" if DEFAULT_ENABLE_COLOR else "禁用"})')
     parser.add_argument('-nc', '--no-color', action='store_false', dest='color',
                        help='禁用彩色输出')
-    parser.add_argument('-t', '--timeout', type=float, default=0.01,
-                       help='数据包超时时间 (默认: 0.01秒)')
-    parser.add_argument('-ts', '--timestamp', action='store_true', default=False,
-                       help='启用时间戳显示 (默认: 关闭)')
-    parser.add_argument('-log', '--log', action='store_true', default=False,
-                       help='启用数据记录 (默认: 关闭)')
-    parser.add_argument('-retry', '--retry', type=int, default=3,
-                       help='连接重试次数 (默认: 3)')
-    parser.add_argument('-delay', '--delay', type=float, default=1.0,
-                       help='连接重试延迟 (默认: 1.0秒)')
+    parser.add_argument('-t', '--timeout', type=float, default=DEFAULT_PACKET_TIMEOUT,
+                       help=f'数据包超时时间 (默认: {DEFAULT_PACKET_TIMEOUT}秒)')
+    parser.add_argument('-ts', '--timestamp', action='store_true', default=DEFAULT_SHOW_TIMESTAMP,
+                       help=f'启用时间戳显示 (默认: {"启用" if DEFAULT_SHOW_TIMESTAMP else "关闭"})')
+    parser.add_argument('-log', '--log', action='store_true', default=DEFAULT_LOG_ENABLED,
+                       help=f'启用数据记录 (默认: {"启用" if DEFAULT_LOG_ENABLED else "关闭"})')
+    parser.add_argument('-retry', '--retry', type=int, default=DEFAULT_CONNECTION_RETRIES,
+                       help=f'连接重试次数 (默认: {DEFAULT_CONNECTION_RETRIES})')
+    parser.add_argument('-delay', '--delay', type=float, default=DEFAULT_RETRY_DELAY,
+                       help=f'连接重试延迟 (默认: {DEFAULT_RETRY_DELAY}秒)')
+    parser.add_argument('-modbus', '--modbus', action='store_true', default=DEFAULT_MODBUS_PARSE_ENABLED,
+                       help=f'启用Modbus解析 (默认: {"启用" if DEFAULT_MODBUS_PARSE_ENABLED else "关闭"})')
+    parser.add_argument('-visual', '--visual', action='store_true', default=DEFAULT_VISUALIZATION_ENABLED,
+                       help=f'启用数据可视化 (默认: {"启用" if DEFAULT_VISUALIZATION_ENABLED else "关闭"})')
     
     args = parser.parse_args()
     
@@ -712,7 +767,7 @@ def main():
     setup_autocomplete()
     
     # 确定波特率
-    baudrate = args.baudrate if args.baudrate is not None else 115200
+    baudrate = args.baudrate
     
     port_name = args.port
     if not port_name:
@@ -732,18 +787,17 @@ def main():
             return
         
         # 如果没有通过命令行指定波特率，让用户选择
-        if args.baudrate is None:
+        if args.baudrate == DEFAULT_BAUDRATE:
             baudrate = select_baudrate()
     
     # 创建串口通信对象
-    communicator = SerialCommunicator(port_name, baudrate)
+    communicator = SerialCommunicator(port=port_name, baudrate=baudrate)
     communicator.set_packet_timeout(args.timeout)
     communicator.connection_retries = args.retry
     communicator.retry_delay = args.delay
-    
-    # 设置时间戳显示
-    if args.timestamp:
-        communicator.toggle_timestamp()
+    communicator.show_timestamp = args.timestamp
+    communicator.modbus_parse_enabled = args.modbus
+    communicator.visualization_enabled = args.visual
     
     # 设置数据记录
     if args.log:
